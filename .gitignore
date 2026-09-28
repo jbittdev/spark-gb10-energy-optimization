@@ -1,0 +1,8 @@
+# Private audit results (targets may be private repos) — never push
+audit/results/
+
+# Editor / OS junk
+*.swp
+*.swo
+*~
+.DS_Store

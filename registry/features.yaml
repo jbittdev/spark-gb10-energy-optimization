@@ -1,0 +1,903 @@
+# GB10 Power & Thermal — Capability Registry
+#
+# Purpose: a discrete, testable catalog of every known power/thermal/efficiency
+# capability for the NVIDIA GB10 platform (DGX Spark / ASUS Ascent GX10 class).
+# Consume with: audit/AUDIT-PLAYBOOK.md (how to check a target repo against this).
+#
+# Field guide:
+#   id          stable ID — cite this in review notes
+#   tier        core      = the headline capabilities (a serious repo should have them)
+#               valuable  = measurably helpful, situational
+#               advanced  = expert / exploratory surface
+#   signals     strings/patterns that indicate an implementation exists.
+#               "code" items are grep-able; "sysfs"/"cmd" items are runtime checks.
+#   verify      how to confirm it actually works (not just present)
+#   ref         section in FINDINGS-LANDSCAPE.md with full evidence
+
+version: 2
+# v2 changelog: +9 features from deep-dive doc gap analysis — GPU-IDLELOCK-01,
+# CX7-LINK2-01, FAB-HEALTH-01, CPU-AFFINITY-01, CPU-MPAM-01, OPS-WATCHDOG-01,
+# OPS-PAGECACHE-01, OPS-UMA-01, OPS-RECOVERY-01; summaries extended for
+# GOV-LOOP-01, VLLM-IDLESIG-01, GPU-UV-01, CX7-PORT2-01, PERI-ASPM-01,
+# PERI-R8127-01, PERI-HEADLESS-01, PERI-KCMD-01, MEAS-SURVEY-01, OPS-SOAK-01,
+# NEG-KNOWLEDGE-01.
+platform: "NVIDIA GB10 (DGX Spark, ASUS Ascent GX10, and GB10 siblings)"
+
+categories:
+  - id: gpu          # GPU clocks, power, thermal protection
+  - id: cpu          # cpufreq, governors, scheduling, cores
+  - id: inference    # vLLM / serving-stack idle behavior
+  - id: firmware     # SPBM / EC / MOK surface
+  - id: fabric       # ConnectX-7 / networking
+  - id: peripherals  # ASPM, NICs, USB, NVMe, services
+  - id: governance   # closed-loop control, safety harnesses
+  - id: measurement  # metering, A/B methodology, surveys
+  - id: ops          # stability policy, update discipline
+
+features:
+
+  # ---------------------------------------------------------------- GPU
+  - id: GPU-CAP-01
+    name: GPU SM clock cap (thermal/power protection)
+    tier: core
+    category: gpu
+    summary: >
+      Cap the SM clock ceiling via `nvidia-smi -lgc <min>,<max>` (community
+      sweet spot 2000–2300 MHz). Turns high-70s–80s °C sustained thermal-shutdown
+      behavior into mid-to-high-60s °C steady state at ~zero decode cost (decode is
+      memory-bandwidth-bound). Also guards the ~75 W GPU-rail power-delivery
+      abort mode that trips far below the ~95 °C thermal trip point.
+    signals:
+      code:
+        - 'nvidia-smi.{0,20}-lgc'
+        - 'nvmlDeviceSetGpuLockedClocks'
+        - 'nvmlDeviceResetGpuLockedClocks'
+      cmd: ['nvidia-smi -q -d CLOCK', 'nvidia-smi --query-gpu=clocks.sm']
+    verify: apply cap under load; hottest thermal zone drops 15–20 °C with <5 % decode throughput change (prefill pays, decode does not)
+    refs: ['FINDINGS-LANDSCAPE.md §1']
+
+  - id: GPU-CAP-02
+    name: Clock-cap persistence across reboots (systemd oneshot)
+    tier: core
+    category: gpu
+    summary: >
+      `-lgc` caps do not survive reboot, and a post-thermal-shutdown boot
+      returns to full 3003 MHz immediately. Requires a systemd oneshot
+      (After=nvidia-persistenced.service, RemainAfterExit) re-applying the cap
+      at every boot, plus re-assertion in deployment/launch scripts.
+    signals:
+      code:
+        - 'RemainAfterExit=yes'
+        - 'After=nvidia-persistenced'
+        - 'WantedBy=multi-user.target'
+        - '(?i)oneshot'
+    verify: reboot, then `nvidia-smi -q -d CLOCK` shows the cap still applied
+    refs: ['FINDINGS-LANDSCAPE.md §1']
+
+  - id: GPU-PHASE-01
+    name: Phase-based GPU clocks (prefill vs decode split)
+    tier: advanced
+    category: gpu
+    summary: >
+      A single cap number is wrong for mixed workloads: decode is
+      memory-bandwidth-bound (cap is ~free) but cold prefill is compute-bound
+      (+3.9 % @ 2200 MHz, +13 % @ 1800 MHz). Better: run prefill at the cap
+      knee (~2200) and drop to ~1700 during decode, switched off the serving
+      engine's prompt-token rate.
+    signals:
+      code:
+        - 'prompt.{0,20}token.{0,20}rate'
+        - '(prefill|decode).{0,30}(clock|lgc|cap)'
+    verify: A/B long-context mixed benchmark vs static cap; prefill TTFT parity with lower decode energy
+    refs: ['FINDINGS-LANDSCAPE.md §1, §7']
+
+  - id: GPU-IDLE-01
+    name: GPU idle-floor diagnosis (context residency)
+    tier: valuable
+    category: gpu
+    summary: >
+      Any resident CUDA context (even ~100 MB at 0 % util) forces P0/1391 MHz
+      and +1.6 W on the GPU rail; it releases instantly on context death.
+      The floor is NOT caused by clock caps — cap relaxation cannot lower it.
+      Correct levers are DPM=2 / TegraGpuPgMask-class. A repo that mis-attributes
+      this is a review red flag.
+    signals:
+      code:
+        - 'P0.{0,20}1391|1391.{0,20}MHz'
+        - 'context.{0,20}(residency|floor|P0)'
+        - 'TegraGpuPgMask|DPM'
+    verify: bare CUDA context test (torch.zeros(1,device=''cuda'') + sleep) forces P0; killing it restores P8/208
+    refs: ['FINDINGS-LANDSCAPE.md §0, §4']
+
+  - id: GPU-IDLELOCK-01
+    name: GPU idle clock floor lock (RM minimum 208 MHz, idle-keyed)
+    tier: core
+    category: gpu
+    summary: >
+      A resident CUDA context pins the GPU at P0/~1.4 GHz (+~1.5 W). Locking
+      the clock FLOOR low while idle (-lgc 208,2200 serving form; 208 is the
+      RM hard minimum — lower values clamp to it) and releasing on first
+      activity recovered ~2.5 W/node (~10 W multi-node), over-delivering
+      rail-level predictions (suspected DVFSRC/uncore coupling). Must ship
+      conditional (idle-keyed daemon): a static floor-lock serves tokens at
+      the floor. Costs: first request after long idle can pay ~250 ms TTFT
+      (poll-interval bound; tune poll or raise the idle floor); re-check
+      clocks after release — a post-release app-clock wedge (~5 W residual)
+      was observed once.
+    signals:
+      code: ['-lgc\\s+208', 'gpu_idle_mhz', '208,2200', '-rgc', 'idle.?floor.{0,20}lock']
+    verify: idle GPU near ~1 GHz / low watts with context resident; first-request TTFT within ~10 % of unlocked; release restores ceiling
+    refs: ['FINDINGS-LANDSCAPE.md §1, §4']
+
+  - id: GPU-UV-01
+    name: Clock-offset undervolt (load efficiency)
+    tier: advanced
+    category: gpu
+    summary: >
+      Lock a clock, then apply a positive GPC clock offset via
+      nvmlDeviceSetClockOffsets (driver ≥ 555): the GPU runs that clock at a
+      lower voltage point. 0 W idle value; 5–15 W under load. No VF-curve
+      editor exists on Linux for GB10; this is the only voltage-adjacent handle.
+      Silent-corruption risk: validate with a determinism envelope + token-
+      garbage detector, step +25 MHz, back off 50; restore = offset 0 + clock
+      release. Memory clock/memlock is NOT exposed on the unified LPDDR5X
+      controller (expect NOT_SUPPORTED) — the DRAM operating point is
+      firmware-only.
+    signals:
+      code: ['nvmlDeviceSetClockOffsets', 'clock.?offset']
+    verify: power.draw at locked clock+offset lower than at same clock with zero offset, same throughput
+    refs: ['FINDINGS-LANDSCAPE.md §1']
+
+  - id: GPU-PWR-01
+    name: GPU-rail power ceiling guard
+    tier: advanced
+    category: gpu
+    summary: >
+      Units have hard power-off aborts near ~75 W GPU rail at temperatures far
+      below the ~95 °C trip point (power-delivery, not thermal). A guard that
+      watches GPU-rail watts (SPBM `gpu` rail or power.draw) and backs clocks
+      off before it is the correct protection for this failure mode.
+    signals:
+      code: ['rail.{0,20}power', 'power.{0,20}ceiling', '75\s*W']
+    verify: harness aborts when rail power crosses threshold under synthetic load
+    refs: ['FINDINGS-LANDSCAPE.md §1, §7']
+
+  # ---------------------------------------------------------------- CPU
+  - id: CPU-CAP-01
+    name: P-core frequency cap (scaling_max_freq ceiling)
+    tier: core
+    category: cpu
+    summary: >
+      Write scaling_max_freq on P-core policies only (E-cluster is ~10 % of
+      package power; capping it buys little). Ceiling-only: never touch
+      scaling_min_freq, so idle floors (1378 MHz P / 338 MHz E) still work.
+      Voltage drops faster than frequency → first few hundred MHz off the top
+      give disproportionate thermal wins.
+    signals:
+      code:
+        - 'scaling_max_freq'
+        - 'cpuinfo_max_freq'
+      cmd: ['cat /sys/devices/system/cpu/cpufreq/policy*/scaling_max_freq']
+    verify: capped load shows lower package watts/temps; idle cores still reach hardware floor
+    refs: ['FINDINGS-LANDSCAPE.md §2.1']
+
+  - id: CPU-CAP-02
+    name: All-core cap with independent E-core ceiling
+    tier: valuable
+    category: cpu
+    summary: >
+      Two-arg cap: P ≤ X, E ≤ Y (Y typically much lower — E-cores run
+      housekeeping and can be clamped hard). One number caps both clusters;
+      a second caps E separately. Where E-core savings live.
+    signals:
+      code: ['allcore|all.?core', '(pcore|p.?core).{0,20}(ecore|e.?core)']
+    verify: background-housekeeping workload shows E-cluster watt drop
+    refs: ['FINDINGS-LANDSCAPE.md §2.1, §7']
+
+  - id: CPU-CAP-03
+    name: CPPC auto_select disable before capping
+    tier: core
+    category: cpu
+    summary: >
+      On DGX OS 7.4+/kernel 6.17+, CPPC autonomous selection ignores
+      scaling_max_freq — writing a cap with auto_select=1 is a silent no-op.
+      Correct order: auto_select=0 per policy, then cap.
+    signals:
+      code: ['auto_select']
+    verify: cap applied with auto_select=1 does not bind; with 0 it does
+    refs: ['FINDINGS-LANDSCAPE.md §2.1']
+
+  - id: CPU-DETECT-01
+    name: P/E-core auto-detection (no hardcoded indices)
+    tier: core
+    category: cpu
+    summary: >
+      Core numbering interleaves P and E clusters (P = cpus 5–9 & 15–19;
+      E = 0–4 & 10–14) and clock bins vary by unit/OEM (3900/3978/4004 MHz).
+      Detection must be by largest gap between distinct cpuinfo_max_freq
+      values — hardcoded core-index lists break across units.
+    signals:
+      code: ['cpuinfo_max_freq.{0,60}(gap|max|min|distinct|sort)', 'related_cpus']
+    anti_signals: ['policy5|cpu.?5.{0,20}hardcod', fixed core-number lists]
+    verify: script produces identical P/E classification on units with different bins
+    refs: ['FINDINGS-LANDSCAPE.md §0, §2.1']
+
+  - id: CPU-GOV-01
+    name: Governor switch to schedutil (enables EAS)
+    tier: valuable
+    category: cpu
+    summary: >
+      DGX OS ships `performance` on all 20 policies. Switching every policy to
+      schedutil turns on Energy Aware Scheduling — small wake-ups land on
+      E-cores (338 MHz floor) instead of P-cores (1378 MHz floor). The
+      placement win is bigger than the frequency-choice itself. All EAS
+      preconditions hold on GB10 except the governor.
+    signals:
+      code: ['schedutil', 'energy_aware', 'EAS']
+    verify: cat /proc/sys/kernel/sched_energy_aware = 1 and energy_model dir present after switch on ALL policies
+    refs: ['FINDINGS-LANDSCAPE.md §2.2']
+
+  - id: CPU-GOV-02
+    name: CPPC autonomous mode + EPP
+    tier: valuable
+    category: cpu
+    summary: >
+      auto_select=1 + energy_performance_preference_val (0–255) +
+      min_perf/max_perf + auto_act_window hands DVFS to MediaTek MCUPM firmware
+      with finer granularity than the kernel tick; boot param
+      cppc_cpufreq.auto_sel_mode=1 enables from boot.
+    signals:
+      code: ['energy_performance_preference', 'auto_act_window', 'auto_sel_mode', 'EPP|epp']
+    refs: ['FINDINGS-LANDSCAPE.md §2.2']
+    verify: sysfs files exist per policy; EPP write accepted
+
+  - id: CPU-UCLAMP-01
+    name: uclamp clamp for unpatchable spinners
+    tier: advanced
+    category: cpu
+    summary: >
+      A busy-spinning thread reports util 1024 and drags clocks to max. Put
+      the serving stack in a cgroup v2 slice and cap cpu.uclamp.max (or clamp
+      only while the system is idle) — makes residual spin cheap; works inside
+      vendor containers you cannot modify.
+    signals:
+      code: ['uclamp', 'cpu\\.uclamp\\.max']
+    verify: spinning slice no longer raises cluster frequency; real inference unaffected
+    refs: ['FINDINGS-LANDSCAPE.md §2.3']
+
+  - id: CPU-AFFINITY-01
+    name: Serving-thread P-core affinity
+    tier: valuable
+    category: cpu
+    summary: >
+      GB10 decode is host-launch-bound; letting serving/NCCL threads float to
+      E-cores (338 MHz floor) costs decode headroom. Pin serving and NCCL
+      threads (cpuset/taskset/docker cpuset) to P-cores — discovered via
+      cpuinfo_max_freq, never hardcoded indices.
+    signals:
+      code: ['taskset|cpuset|cpu.?affinity', 'NCCL_IGNORE_CPU_AFFINITY|NCCL_PIN']
+    refs: ['FINDINGS-LANDSCAPE.md §2.3']
+
+  - id: CPU-MPAM-01
+    name: MPAM/resctrl memory-bandwidth partitioning
+    tier: advanced
+    category: cpu
+    summary: >
+      MPAM + resctrl are backported in the GB10 kernel. Capping a background
+      job's memory-bandwidth share keeps the memory subsystem out of
+      high-power states under load; no idle effect. Load-shaping, not idle.
+    signals:
+      code: ['MPAM|resctrl', 'schemata|mb.?max']
+    refs: ['FINDINGS-LANDSCAPE.md §2.3']
+
+  - id: CPU-COOL-01
+    name: ACPI Processor cooling device as freq QoS ceiling
+    tier: advanced
+    category: cpu
+    summary: >
+      /sys/class/thermal/cooling_device* type=Processor: 3 states × −20 % max
+      frequency via frequency QoS — survives governor changes that would
+      rewrite scaling_max_freq. Good belt-and-braces ceiling for a governor
+      to raise/lower.
+    signals:
+      code: ['cooling_device', 'cur_state']
+    refs: ['FINDINGS-LANDSCAPE.md §2.3']
+
+  - id: CPU-OFFLINE-01
+    name: P-core offlining (deep-idle fallback)
+    tier: advanced
+    category: cpu
+    summary: >
+      Only when cpuidle offers nothing deeper than WFI: offline P-cores at
+      idle (keep E-cores + 2 P-cores), restore on activity. GB10 has
+      LPI-0..3, so usually unnecessary — a good repo gates this on a survey.
+    signals:
+      code: ['online', 'cpuidle', 'offline.?pcore']
+    refs: ['FINDINGS-LANDSCAPE.md §2.3']
+
+  - id: CPU-FLOOR-01
+    name: scaling_min_freq floor correction
+    tier: valuable
+    category: cpu
+    summary: >
+      The driver defaults scaling_min_freq to lowest_nonlinear_perf, which is
+      ABOVE the firmware-declared lowest_perf (1378 MHz X925 / 338 MHz A725).
+      Writing cpuinfo_min_freq into scaling_min_freq is free idle savings.
+    signals:
+      code: ['scaling_min_freq', 'cpuinfo_min_freq']
+    refs: ['FINDINGS-LANDSCAPE.md §2.2']
+
+  # ---------------------------------------------------------------- INFERENCE
+  - id: VLLM-SPIN-01
+    name: vLLM shm_broadcast busy-loop spin fix
+    tier: core
+    category: inference
+    summary: >
+      SpinCondition.wait() spins with sched_yield for busy_loop_s (default
+      1.0 s) after every read; periodic wake-ups keep a core pegged forever
+      per reader process. Measured: Worker_TP 40 %+ CPU + ~8,000 IRQ/s at zero
+      traffic. Fix (plugin/patch, busy_loop_s=0.002): ~−70 % idle CPU,
+      ~−20 °C SoC, ~−10 W multi-node idle. vLLM ≥ v0.28.0 is idle-clean natively
+      (parks in blocking zmq poll) — a version-aware implementation retests
+      before patching.
+    signals:
+      code:
+        - 'busy_loop_s'
+        - 'VLLM_SLEEP_WHEN_IDLE'
+        - 'shm_broadcast'
+        - 'sched_yield'
+    verify: short-window top (2nd sample) shows Worker/EngineCore 0–5 % at idle; IRQ rate drops to timer floor
+    refs: ['FINDINGS-LANDSCAPE.md §3']
+
+  - id: VLLM-RAY-01
+    name: No-Ray multi-node mode (kills idle GPU pin + daemons)
+    tier: valuable
+    category: inference
+    summary: >
+      Ray deployments pin idle GPUs at ~2.4 GHz/100 % util and Ray daemons
+      poll constantly. Fix order: mp executor with --nnodes/--node-rank/
+      --master-addr (no Ray); else VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE=shm
+      for Ray+PP>1; else a governor GPU lock while no requests in flight.
+    signals:
+      code: ['no.?ray', 'VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE', 'ray.*dashboard.*(false|disable)']
+    refs: ['FINDINGS-LANDSCAPE.md §3']
+
+  - id: VLLM-NCCL-01
+    name: NCCL heartbeat idle-death guard
+    tier: valuable
+    category: inference
+    summary: >
+      After long idle, the torch NCCL watchdog can SIGABRT a worker
+      (vllm#42742). Set TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=86400 or
+      TORCH_NCCL_ENABLE_MONITORING=0 on idle-heavy clusters.
+    signals:
+      code: ['TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC', 'TORCH_NCCL_ENABLE_MONITORING']
+    refs: ['FINDINGS-LANDSCAPE.md §3']
+
+  - id: VLLM-IDLESIG-01
+    name: Correct idle signal (scheduler gauges, not GPU util)
+    tier: valuable
+    category: inference
+    summary: >
+      utilization.gpu is useless as an idle signal (a parked NCCL collective
+      kernel polls a flag: ~96 % util at ~15 W, zero memory traffic).
+      Ground truth: num_requests_running + num_requests_waiting == 0 from the
+      serving engine's metrics. Fails safe to BUSY when the endpoint is
+      unreachable. Worker nodes run no API server: idle signal falls back to
+      fabric-traffic rate on the CX7 netdev (>~2 Mbit/s = active) plus NVML
+      utilisation.
+    signals:
+      code: ['num_requests_running', 'num_requests_waiting', '/metrics', 'fabric_iface']
+    anti_signals: [idle detection keyed only on utilization\.gpu or power\.draw]
+    refs: ['FINDINGS-LANDSCAPE.md §3, §7']
+
+  # ---------------------------------------------------------------- FIRMWARE
+  - id: FW-SPBM-01
+    name: SPBM per-rail power telemetry
+    tier: advanced
+    category: firmware
+    summary: >
+      MediaTek SSPM System Power Budget Manager exposes per-rail watts
+      (sys_total, soc_pkg, cpu_gpu, gpu, vcore, prereg, cpu_p/e), 8 temp
+      channels, PROCHOT flag, 100 ms cadence — via spark_hwmon or a superset
+      kernel module. Drift floor ~0.03 W; replaces UPS-guessing. Secure Boot makes
+      MOK enrollment the sanctioned load path.
+    signals:
+      code: ['spark_hwmon', 'sys_total', 'soc_pkg', 'MOK|mokutil']
+    refs: ['FINDINGS-LANDSCAPE.md §6.1, §8']
+
+  - id: FW-SPBM-02
+    name: SPBM power-limit overrides (the real wattage lever)
+    tier: advanced
+    category: firmware
+    summary: >
+      `*_VAL_OS` registers for PL1–PL4/SYSPL1–SYSPL4/EDPC + UPDATE_SPBM poke =
+      the only true power-limit handle on the platform (nvidia-smi -pl is N/A).
+      Caps matter for load-shaping, not idle; an aggressive active cap acts as
+      an undervolt (firmware picks lower V/F points). Snapshot-restore safety
+      model: caps revert on write-0 or reboot.
+    signals:
+      code: ['PL1|SYSPL', '_OS_|VAL_OS', 'UPDATE_SPBM']
+    refs: ['FINDINGS-LANDSCAPE.md §6.2']
+
+  - id: FW-EC-01
+    name: EC / FF-A surface awareness (MSFT000C)
+    tier: advanced
+    category: firmware
+    summary: >
+      The EC (Microchip MEC1723) is reached via Arm FF-A secure services
+      (ACPI MSFT000C): power, thermal, fan (PNP0C0B), battery services.
+      Community has driven the fan via EC command 5. Packet layouts greppable
+      from a DSDT dump. Fan control is accepted-risk territory — a good repo
+      documents it as exists/unexplored rather than shipping it casually.
+    signals:
+      code: ['MSFT000C', 'FF-A|FFA', 'PNP0C0B', 'acpi.?dump']
+    refs: ['FINDINGS-LANDSCAPE.md §6.3']
+
+  - id: FW-DIAG-01
+    name: perf_limited CPPC diagnostic
+    tier: advanced
+    category: firmware
+    summary: >
+      NVIDIA SAUCE sysfs `perf_limited` per cpufreq policy reads the CPPC
+      performance-limited register — distinguishes "the platform is capping
+      me" from "the OS is capping me". Essential when tuning SPBM caps.
+    signals:
+      code: ['perf_limited']
+    refs: ['FINDINGS-LANDSCAPE.md §2.2']
+
+  # ---------------------------------------------------------------- FABRIC
+  - id: CX7-DOMAIN-01
+    name: CX7 domain GPIO power-off (cable inserted)
+    tier: advanced
+    category: fabric
+    summary: >
+      The MTKP0001 hotplug controller owns the EN power GPIO for the whole CX7
+      package (both chips, 4 PFs, 2 PCIe domains). Writing
+      /sys/bus/platform/devices/MTKP0001:00/pcie_hotplug/debug_state 0/1 +
+      PF remove/rescan powers the NIC off/on electrically with the cable
+      inserted. ~18–20 W/node. All-or-nothing: kills fabric — only for
+      non-serving nodes or maintenance windows. Restore is clean (~30 s).
+    signals:
+      code: ['MTKP0001', 'debug_state', 'pcie_hotplug']
+    refs: ['FINDINGS-LANDSCAPE.md §5']
+
+  - id: CX7-PORT2-01
+    name: Unused CX7 port-2 power-down (NV config)
+    tier: valuable
+    category: fabric
+    summary: >
+      Firmware mlxconfig knobs on the unused port:
+      AUTO_POWER_SAVE_LINK_DOWN_P2=1, KEEP_ETH_LINK_UP_P2=0,
+      KEEP_LINK_UP_ON_BOOT_P2=0, KEEP_LINK_UP_ON_STANDBY_P2=0, optional
+      HIDE_PORT2_PF=1. Applies after NIC reset. Runtime: admin-down BOTH
+      port-2 PFs (socket-direct wiring = 2 PFs per physical port) +
+      mstlink --port_state DN. Additional port-2 levers: unbind mlx5_core
+      from the PFs (frees EQs/MSI-X, stops FW polling) and NIC-side ASPM
+      advertising (PCI_BUS0x_ASPM NV params) if the host shows L1-capable.
+      Non-levers on the LINKED port: MTU/flow-control/interrupt-moderation
+      (SerDes cost unchanged); ASPM never engages while NCCL traffic flows;
+      speed-down breaks the 200G requirement. Expected 1–4 W. Safety: NV
+      changes only with cable state stable since boot (mstflint-after-hotplug
+      kernel panic, mstflint#1786).
+    signals:
+      code: ['AUTO_POWER_SAVE_LINK_DOWN_P2', 'KEEP_ETH_LINK_UP_P2', 'HIDE_PORT2_PF', 'mstlink|mlxconfig']
+    refs: ['FINDINGS-LANDSCAPE.md §5']
+
+  - id: CX7-THROTTLE-01
+    name: NIC power-throttle detection & recovery (13 Gb/s trap)
+    tier: valuable
+    category: fabric
+    summary: >
+      Driver 580.126.09 reports insufficient PCIe slot power (27 W) and
+      throttles the NIC to ~13 Gb/s; a stuck throttle also survives cable
+      hot-swap. Canary: per-link ib_write_bw baseline + lspci LnkSta vs
+      LnkCap; recovery = newer driver or reboot. A repo that manages fabric
+      health should know this failure mode.
+    signals:
+      code: ['13\s*Gb|ib_write_bw|LnkSta', 'power.?throttle']
+    refs: ['FINDINGS-LANDSCAPE.md §5']
+
+  - id: FAB-DAC-01
+    name: Breakout DAC low-power pinning
+    tier: advanced
+    category: fabric
+    summary: >
+      Passive breakout DACs can stick at low power/half rate. Fix: force
+      auto-negotiation=no + explicit speed on master subports (switch side)
+      and pin the node side. Symptom: a leg that trains but underperforms.
+    signals:
+      code: ['auto.?negotiation', 'DAC']
+    refs: ['FINDINGS-LANDSCAPE.md §5']
+
+  - id: CX7-LINK2-01
+    name: Second socket-direct PCIe link reduction (drop / gen-downshift)
+    tier: advanced
+    category: fabric
+    summary: >
+      The CX7 hangs off two Gen5 x4 host links. Removing the second domain's
+      PFs and Link-Disabling its root port (setpci CAP_EXP Link Control;
+      restore = clear + rescan) saves ~1–2 W and caps host↔NIC to ~110 Gb/s —
+      decode is latency-bound (kB/step) and won't notice; long-prefill
+      all-reduces might. Pin NCCL_IB_HCA to the surviving device so NCCL does
+      not wait on the removed one. A gentler variant (host-PCIe gen
+      downshift, est. 5–14 W) risks failed-retrain fabric drops — maintenance
+      windows only.
+    signals:
+      code: ['0002:01:00', 'CAP_EXP', 'Link.?Disable', 'gen.?downshift']
+    refs: ['FINDINGS-LANDSCAPE.md §5']
+
+  - id: FAB-HEALTH-01
+    name: Fabric link-health canaries (counters, DOM, GID drift)
+    tier: valuable
+    category: fabric
+    summary: >
+      Sustained-load fabric checks: error-counter deltas (err/drop/retrans/
+      out_of_seq/PFC/ECN) before vs after load — growth means PFC/ECN is
+      missing and throughput throttles; DOM rx/tx power margins catch lane
+      degradation before bandwidth loss; GID tables drift after reboots
+      (re-check or set IB GID auto-detect). PCIe LnkSta-vs-LnkCap is the
+      stuck-power-throttle canary.
+    signals:
+      code: ['retrans|out_of_seq', 'PFC|ECN', 'DOM|rx.?power', 'show_gids|GID_INDEX']
+    refs: ['FINDINGS-LANDSCAPE.md §5']
+
+  - id: FAB-RATE-01
+    name: Fabric link-rate power sweep
+    tier: advanced
+    category: fabric
+    summary: >
+      Decode is link-independent (±3 %); 200G pays only on cold prefill and
+      aggregate. Dropping link rate (PHY_RATE_MASK both ends + switch) saves
+      SerDes power; needs both ends + switch access. Untested — surface only.
+    signals:
+      code: ['PHY_RATE_MASK', 'rate.?sweep']
+    refs: ['FINDINGS-LANDSCAPE.md §5, §13']
+
+  # ---------------------------------------------------------------- PERIPHERALS
+  - id: PERI-ASPM-01
+    name: PCIe ASPM powersupersave
+    tier: core
+    category: peripherals
+    summary: >
+      Biggest measured single lever: ≈ −3 W (policy powersupersave; ≈ −1 W
+      each from PHY/links and root ports). Also apply runtime PM `auto` to
+      every PCI device, including empty hotplug ports (D3-capable per DSDT,
+      ~1–4 W). CX7 endpoints do not support ASPM (excluded);
+      affected: NVMe, r8127, bridges. Persistence = pcie_aspm.policy=
+      powersupersave cmdline; requires multi-day soak + serial-console
+      lifeline before adoption (r8127 is typically the SSH path).
+    signals:
+      code: ['pcie_aspm', 'powersupersave', 'l1_aspm', 'policy']
+    verify: sys_total or UPS delta ≈ −2 to −3 W; SSH survives; revert clean
+    refs: ['FINDINGS-LANDSCAPE.md §4, §10']
+
+  - id: PERI-HEADLESS-01
+    name: Headless posture (multi-user + modeset off + display unplug)
+    tier: core
+    category: peripherals
+    summary: >
+      systemctl set-default multi-user.target (~3 W), unplug display (~3 W),
+      nvidia-drm.modeset=0 so the display engine never initializes. Also stop
+      the display manager itself (gdm3): the compositor holds a resident GL
+      context and vblank CPU wakeups even when "headless-ish". Display-engine
+      module blacklist measured ≈0.2 W once the GPU floor fix is in — keep
+      the emergency-recovery note (UEFI drives the screen pre-boot, so BIOS/
+      GRUB display still works; removing the cmdline param restores KMS).
+      Monitor at idle costs ≈ +0.4 W. Monitor hotplug on a long-headless box
+      can wedge nvidia-modeset/kthread_q at 100 % (clean boot fixes).
+    signals:
+      code: ['multi-user\\.target', 'nvidia-drm\\.modeset', 'graphical\\.target']
+    refs: ['FINDINGS-LANDSCAPE.md §10']
+
+  - id: PERI-R8127-01
+    name: Realtek r8127 mgmt-NIC link power management
+    tier: valuable
+    category: peripherals
+    summary: >
+      The 10GbE mgmt NIC uses the vendor r8127 driver (not r8169); a linked
+      10G PHY burns ~2.5–4 W regardless of traffic. Levers: vendor options
+      `r8127 aspm=1 eee_enable=1 eee_giga_lite=1` (PCIe policy alone is not
+      enough on Realtek); EEE on to stay 10G, or advertise down to 1G
+      (ethtool advertise, brief link flap — multi-W prize); or admin-down if
+      the box is managed over the fabric. Caution: this is typically the mgmt
+      SSH path — keep a second session open and revert on flake.
+    signals:
+      code: ['r8127', 'eee_enable', 'eee_giga_lite']
+    refs: ['FINDINGS-LANDSCAPE.md §10']
+
+  - id: PERI-RF-01
+    name: Wi-Fi/BT/USB/NVMe peripheral power-down
+    tier: valuable
+    category: peripherals
+    summary: >
+      rfkill/unbind/UEFI-disable MT7925 Wi-Fi+BT (0.5–1 W; Feb-2026 UEFI has a
+      switch → clean D3cold); xHCI runtime PM auto + usbcore.autosuspend=1;
+      verify NVMe APST reachable (nvme_core.default_ps_max_latency_us).
+    signals:
+      code: ['rfkill', 'autosuspend', 'APST|apst', 'default_ps_max_latency']
+    refs: ['FINDINGS-LANDSCAPE.md §10']
+
+  - id: PERI-POLLER-01
+    name: Telemetry poller cleanup (with honest expectations)
+    tier: valuable
+    category: peripherals
+    summary: >
+      Anything calling NVML/nvidia-smi on a timer wakes GPU+cores (nvsm, dcgm,
+      dgx-dashboard, exporters, snapd, fwupd-refresh, unattended-upgrades,
+      ModemManager, cups, avahi). Measured ≈ 0 W on a lean image — expected
+      value is image-dependent (0–1.5 W); a good repo presents it as
+      measure-first, not as a guaranteed win.
+    signals:
+      code: ['poller|dashboard|exporter|snapd|fwupd|unattended']
+    refs: ['FINDINGS-LANDSCAPE.md §4, §10']
+
+  - id: PERI-KCMD-01
+    name: Kernel cmdline power bundle
+    tier: valuable
+    category: peripherals
+    summary: >
+      Reboot-only bundle: pcie_port_pm=force
+      nvme_core.default_ps_max_latency_us=100000 usbcore.autosuspend=1
+      nvidia-drm.modeset=0 pcie_aspm.policy=powersupersave
+      cppc_cpufreq.auto_sel_mode=1 vm.dirty_writeback_centisecs=6000
+    signals:
+      code: ['pcie_port_pm', 'autosuspend', 'cppc_cpufreq\\.auto_sel_mode']
+    refs: ['FINDINGS-LANDSCAPE.md §10']
+
+  # ---------------------------------------------------------------- GOVERNANCE
+  - id: GOV-LOOP-01
+    name: Closed-loop thermal/power governor daemon
+    tier: advanced
+    category: governance
+    summary: >
+      Per-node daemon holding a temperature target on the hottest sensor,
+      walking P-core and GPU clock ladders independently (percentage ladders —
+      bins vary), moving the ladder that matches where heat actually is (with
+      SPBM per-cluster temps), phase-aware GPU clocks, PROCHOT short-circuit,
+      GPU-rail power guard, vLLM-gauge-keyed idle loop that fails safe to BUSY.
+      Worker nodes (no API server) detect activity via fabric-traffic rate on
+      the CX7 netdev plus NVML; optional deterministic wake = a /wake listener
+      the front proxy POSTs before forwarding (clock restore is tens of ms —
+      noise next to prefill).
+      Hard non-goals: never touches CX7 (kills TP group), never unloads the
+      model, never offlines cores, never suspends.
+    signals:
+      code: ['governor', 'thermal.{0,20}target', 'hottest', 'ladder', 'PROCHOT|prochot']
+    refs: ['FINDINGS-LANDSCAPE.md §7']
+
+  - id: GOV-SAFETY-01
+    name: Safety harness for live-node mechanism tests
+    tier: advanced
+    category: governance
+    summary: >
+      4 independent layers: JSON baseline snapshot → in-process restore
+      (atexit + signals) → detached watchdog w/ heartbeat (covers SIGKILL/
+      dropped SSH) → systemd transient backstop. Aborts on temp/PROCHOT/GPU-
+      rail power/TP canary. The TP canary (real 1-token completions through
+      the head endpoint) catches straggler-induced NCCL timeouts before they
+      kill the engine — the failure mode that actually costs something.
+    signals:
+      code: ['baseline', 'watchdog', 'heartbeat', 'atexit', 'canary', 'restore']
+    refs: ['FINDINGS-LANDSCAPE.md §7, §8']
+
+  - id: GOV-STATIC-01
+    name: Static cap companions (systemd oneshots, zero deps)
+    tier: valuable
+    category: governance
+    summary: >
+      One-number scripts: pcore-cap, allcore-cap (2-arg), gpu-cap. All write
+      the ceiling only (scaling_max_freq / -lgc 0,MHz), never the floor;
+      mutual-exclusion documented (never run two writers of the same node);
+      ExecStop= reset; reboot-surviving via systemd oneshot.
+    signals:
+      code: ['pcore|allcore|gpu.?cap', 'ExecStop', 'reset']
+    refs: ['FINDINGS-LANDSCAPE.md §7']
+
+  # ---------------------------------------------------------------- MEASUREMENT
+  - id: MEAS-AB-01
+    name: A/B measurement discipline (tooling + method)
+    tier: core
+    category: measurement
+    summary: >
+      One lever at a time; same-session baselines (cross-session ambient drift
+      up to 2 W); drained → measure → apply → measure → revert → measure
+      (residue check); two passes for spread. SPBM energy counters (0.03 W
+      floor) or UPS wall reading (2-min settle; deltas clean if legs match).
+    signals:
+      code: ['powerab|a/b|measure', 'baseline', 'revert', 'settle']
+    refs: ['FINDINGS-LANDSCAPE.md §8']
+
+  - id: MEAS-SURVEY-01
+    name: Read-only platform survey tool
+    tier: valuable
+    category: measurement
+    summary: >
+      One-shot inventory: cpufreq policies (cur/min/max/gov/auto_select),
+      ASPM LnkCap/LnkCtl per endpoint, cpuidle states, runtime-PM, NVMe APST,
+      USB autosuspend, poller services, thermal zones, GID tables — plus
+      firmware/driver ground truth per node (driver + GSP firmware versions,
+      kernel, OTA meta, EC/SoC/USB-PD firmware). Read-only,
+      safe on live serving nodes; -m (mstconfig) opt-in with cable-stable
+      caveat (ICMD panic risk).
+    signals:
+      code: ['survey', 'LnkCap', 'cpuidle', 'APST']
+    refs: ['FINDINGS-LANDSCAPE.md §8']
+
+  - id: MEAS-CPUTRAP-01
+    name: CPU measurement trap awareness (ps pcpu is cumulative)
+    tier: valuable
+    category: measurement
+    summary: >
+      `ps -eo pcpu` is cumulative-since-start — after a relaunch it reports
+      startup work (e.g. 108 %) as if idle. Correct method: short-window
+      sampling (top -bn2 -d5 -1, read the SECOND sample). A repo that
+      measures CPU idle with ps pcpu is quantitatively wrong.
+    signals:
+      code: ['top -bn2', 'pcpu|cumulative']
+    anti_signals: [idle verification via ps -o %cpu alone]
+    refs: ['FINDINGS-LANDSCAPE.md §8']
+
+  - id: MEAS-WAKE-01
+    name: Wakeup census (LPI residency + IRQ signatures)
+    tier: advanced
+    category: measurement
+    summary: >
+      /sys/devices/system/cpu/cpu*/cpuidle (LPI-0..3, latencies 0/42/231/433
+      µs); IRQ-rate decomposition (arch_timer vs IPI vs device) distinguishes
+      spin floors from timer floors and gates whether timer-slack work is
+      worth doing at all.
+    signals:
+      code: ['LPI|cpuidle.*state|residency', 'IRQ|interrupt']
+    refs: ['FINDINGS-LANDSCAPE.md §8']
+
+  - id: MEAS-CONSOLE-01
+    name: Serial-console lifeline for sysfs-risk windows
+    tier: advanced
+    category: measurement
+    summary: >
+      On a headless GB10 the console is NOT revivable over SSH (simpledrm, no
+      connectors). Before ASPM-class or PCI-removal experiments, stage ttyS0
+      (921600 already in cmdline) — this is the documented recovery path.
+    signals:
+      code: ['ttyS0', 'serial.{0,20}console']
+    refs: ['FINDINGS-LANDSCAPE.md §8']
+
+  # ---------------------------------------------------------------- OPS
+  - id: OPS-WATCHDOG-01
+    name: Unattended-serving watchdog (health probe + worker-first relaunch)
+    tier: valuable
+    category: ops
+    summary: >
+      24/7 multi-node serving needs automated recovery: a head-node service
+      polling the health endpoint (~60 s); N consecutive failures → capture
+      logs, tear down ALL ranks, run the memory ritual (drop_caches +
+      compaction), relaunch worker-first, wait healthy (~15-min unattended
+      recovery). Rationale: no in-process engine restart exists, and container
+      restart policies cannot recover a multi-node deployment — workers exit
+      on head death and blind restarts race the stale rendezvous.
+    signals:
+      code: ['watchdog', 'health.{0,20}(probe|check)', 'worker.?first', 'fleet']
+    refs: ['FINDINGS-LANDSCAPE.md §3']
+
+  - id: OPS-PAGECACHE-01
+    name: Boot-time page-cache management for large KV allocations
+    tier: valuable
+    category: ops
+    summary: >
+      Large KV-cache allocations fail against a full page cache (unified
+      memory + container caps interact badly). A flusher (drop_caches +
+      compaction) with a settle window before launch makes the allocation
+      reliable. Model weights re-read from NVMe every boot (large read burst
+      per rank — no VRAM), so cold boots are slow and keep-server-up is the
+      only full fix; page-cache pre-warm is partial (cache exceeds RAM).
+    signals:
+      code: ['drop_caches|compact_memory', 'cache.?flush', 'page.?cache']
+    refs: ['FINDINGS-LANDSCAPE.md §3, §0']
+
+  - id: OPS-UMA-01
+    name: UMA serving limits (GPU-memory-utilization ceiling, no mem% telemetry)
+    tier: valuable
+    category: ops
+    summary: >
+      Platform serving quirks: gpu-memory-utilization must stay ≈0.85 — near
+      0.95 the box hard-reboots during graph capture and the power button is
+      dead when wedged (recovery = unplug/replug). nvidia-smi memory fields
+      are unsupported (unified memory) — size KV from engine boot-log token
+      counts, not NVML, and never extrapolate density across configs.
+      Container memory caps interact badly with unified memory — don't cap
+      tightly.
+    signals:
+      code: ['gpu.?memory.?utilization', '0\\.85', 'kv.?cache.?memory']
+    refs: ['FINDINGS-LANDSCAPE.md §0']
+
+  - id: OPS-RECOVERY-01
+    name: Failure-mode recovery lore (P8 limbo, wedged button, modeset wedge)
+    tier: valuable
+    category: ops
+    summary: >
+      Known failure modes + clears: post-thermal P8/5 W/0 % limbo → full
+      power cycle (battery disconnected ~5 min); unit wedged with dead power
+      button → unplug/replug; nvidia-modeset kthread wedged at 100 % after
+      monitor hotplug on a headless box → clean boot (module unload blocked);
+      some units don't spin fans in headless boot — verify. Runbook material
+      for any 24/7 deployment.
+    signals:
+      code: ['P8|power.?cycle|unplug.{0,20}replug', 'fan.{0,30}(spin|headless)']
+    refs: ['FINDINGS-LANDSCAPE.md §9, §1']
+
+  - id: OPS-DRIVER-01
+    name: Driver/firmware pinning & staging policy
+    tier: valuable
+    category: ops
+    summary: >
+      Known minefield: 580.126 (13 Gb/s NIC throttle), 580.159.03 (3.5×
+      regression + GID reorder), 590.x (CUDAGraph deadlock), 580.142 (fast
+      decode, firmware-pairing conflict), torn driver/firmware OTA pairs =
+      brick. Policy: apt-mark hold, staging pair first, ota-check before/
+      after, full clean reboot between (driver holds ~100 GiB until reboot).
+    signals:
+      code: ['apt-mark|hold', 'staging', 'ota']
+    refs: ['FINDINGS-LANDSCAPE.md §9']
+
+  - id: OPS-SOAK-01
+    name: Sustained soak verification
+    tier: valuable
+    category: ops
+    summary: >
+      Multi-hour prefill+decode soak ×N nodes watching thermal zones, Clocks
+      Event Reasons, XID/ECC before trusting any config; verify BMC/IPMI
+      reachability per node (silent-power-off recovery path); silent-power-off
+      under sustained load is the known chassis failure mode (varies by OEM
+      cooling — vapor-chamber variants run 10–15 °C cooler). Verify fans
+      actually spin in headless boot (known bug on some units). When no
+      cmdline changes are involved, a one-reboot persistence verification can
+      substitute for a long soak.
+    signals:
+      code: ['soak', 'Clocks Event Reasons|XID|ECC']
+    refs: ['FINDINGS-LANDSCAPE.md §9']
+
+  - id: OPS-UNIFORM-01
+    name: Fleet uniformity (driver/kernel/firmware)
+    tier: valuable
+    category: ops
+    summary: >
+      Bit-for-bit driver/kernel/firmware uniformity across cluster nodes is
+      the highest-leverage performance action (order-of-2× prefill documented from
+      syncing nodes). New nodes staged to the same pins before joining.
+    signals:
+      code: ['uniform|sync.{0,20}fleet|version.{0,20}drift']
+    refs: ['FINDINGS-LANDSCAPE.md §9']
+
+  - id: OPS-FW-01
+    name: Platform firmware guidance (v0103-class gains, EC pairing)
+    tier: valuable
+    category: ops
+    summary: >
+      ASUS-class firmware v0103 (2026-03) reportedly −8–10 °C + better CX7
+      links; one "painfully hot chassis" report traced to an EC-firmware
+      regression fixed by rollback (check firmware before buying fans); the
+      2026-02 hot-plug update path took community idle 37 W → 25 W → 22 W.
+      Guidance should say "verify current firmware; stage first" without
+      pinning to unit-specific build strings.
+    signals:
+      code: ['firmware', 'EC', 'rollback']
+    refs: ['FINDINGS-LANDSCAPE.md §1, §9']
+
+  # ---------------------------------------------------------------- NEGATIVES
+  - id: NEG-KNOWLEDGE-01
+    name: Negative-results awareness (don't re-chase dead ends)
+    tier: valuable
+    category: ops
+    summary: >
+      Documented dead ends: poller cleanup ≈ 0 W on lean images; governor
+      choice moves nothing at idle (vcore governor- AND frequency-invariant
+      ≈ 3.7 W — firmware-state-bound); scaling_max 338 kHz = zero delta
+      (CPPC floor clamps); timer-slack unnecessary (>98 % LPI-3 residency);
+      nohz_full/rcu_nocbs P/E isolation expected ~0 at this residency level;
+      VDDQ telemetry register dead on current firmware; EEE on mgmt NIC poor
+      odds; DTPM present-but-DT-dead; fan control exists but accepted-risk.
+      A repo that promises these as wins hasn't measured them.
+    signals:
+      code: ['negative|dead.?end|does not (work|help)|no (win|delta)']
+    refs: ['FINDINGS-LANDSCAPE.md §12']
